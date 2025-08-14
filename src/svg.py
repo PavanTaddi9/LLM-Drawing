@@ -1,40 +1,32 @@
-import os
-import json
-import re
-import logging
-import time
-from typing import Optional, List
-from lxml import etree
-import google.generativeai as genai
-from pydantic import BaseModel
+#| export
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+num_attempt = 6
 
-class SVGConstraints:
-    """Contains allowed elements and attributes"""
+class Model:
     def __init__(self):
-        self.allowed_elements = {
-            'common': ['viewBox', 'width', 'height', 'fill', 'stroke', 
-                      'stroke-width', 'transform', 'opacity'],
-            'svg': [],
-            'path': ['d'],
-            'circle': ['cx', 'cy', 'r'],
-            'rect': ['x', 'y', 'width', 'height', 'rx', 'ry'],
-            'ellipse': ['cx', 'cy', 'rx', 'ry'],
-            'line': ['x1', 'y1', 'x2', 'y2'],
-            'polyline': ['points'],
-            'polygon': ['points'],
-            'g': [],
-            'linearGradient': ['id', 'x1', 'y1', 'x2', 'y2'],
-            'radialGradient': ['id', 'cx', 'cy', 'r'],
-            'stop': ['offset', 'stop-color'],
-            'defs': []
-        }
-
-class SVGGenerator:
-    def __init__(self):
+        self.model_path = kagglehub.model_download('..finetune/qwen-lm/qwen-3/transformers/8b')
+        self.llm = vllm.LLM(
+            self.model_path,
+            quantization=None,
+            tensor_parallel_size=2,
+            gpu_memory_utilization=0.95,
+            trust_remote_code=True,
+            dtype="half",
+            enforce_eager=True,
+            max_model_len=5120,
+            disable_log_stats=True
+        )
+        self.sampling_params = vllm.SamplingParams(
+            n=1,  # Number of output sequences to return for each prompt.
+            top_k=20,  # Float that controls the cumulative probability of the top tokens to consider.
+            top_p=0.8,
+            temperature=0.7,  # randomness of the sampling
+            repetition_penalty=1.05,
+            seed=777, # Seed for reprodicibility
+            skip_special_tokens=False,  # Whether to skip special tokens in the output.
+            max_tokens=1024,  # Maximum number of tokens to generate per output sequence.
+        )
+        self.tokenizer = self.llm.get_tokenizer()
         self.prompt_template = """Generate SVG code to visually represent the following text description, while respecting the given constraints.
 <constraints>
 * **Allowed Elements:** `svg`, `path`, `circle`, `rect`, `ellipse`, `line`, `polyline`, `polygon`, `g`, `linearGradient`, `radialGradient`, `stop`, `defs`
@@ -219,219 +211,175 @@ Please ensure that the generated SVG code is well-formed, valid, and strictly ad
 ```svg
 <svg viewBox="0 0 256 256" width="256" height="256">
 """
-        self.constraints = SVGConstraints()
-        self.default_svg = '''<svg viewBox="0 0 256 256" width="256" height="256">
-    <rect width="256" height="256" fill="white"/>
-    <text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="red">
-        Invalid SVG
-    </text>
-</svg>'''
-        self.max_retries = 3
-        self.retry_delay = 2
-        self.api_delay = 1.5
+        self.default_svg = """<svg width="256" height="256" viewBox="0 0 256 256"><circle cx="50" cy="50" r="40" fill="red" /></svg>"""
+        self.constraints = svg_constraints.SVGConstraints()
+        self.timeout_seconds = 90
 
-    def configure_api(self):
-        """Set up Gemini API credentials"""
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise RuntimeError("GOOGLE_API_KEY environment variable not set")
-        genai.configure(api_key=api_key)
+    # You could try increasing `max_new_tokens`
+    def predict(self, description: str, max_new_tokens=1024) -> str:
+        def apply_template(prompt, tokenizer):
+            messages = [
+                {"role": "user", "content": prompt},
+            ]
+            text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,enable_thinking = False)
+            return text
+        
+        def parse_svg_from_response(response):
+            matchs = re.findall(r'<svg.*?</svg>', response, re.S)
+            if matchs:
+                return matchs[-1].strip()
+            else:
+                return ''
+        
+        def check_svg_valid(svg):
+            try:
+                cairosvg.svg2png(bytestring=svg.encode('utf-8'))
+                return True
+            except:
+                return False
+        
+        def generate_svg():
+            try:
+                prompt = self.prompt_template.format(description)
+                inputs = [apply_template(prompt, self.tokenizer)] * num_attempt
+                responses = self.llm.generate(inputs, self.sampling_params, use_tqdm=False)
+                responses = [x.outputs[0].text for x in responses]
+                svgs = [parse_svg_from_response(x) for x in responses]
+                # use the first valid svg
+                choosen_svg = None
+                for svg in svgs:
+                    if check_svg_valid(svg):
+                        svg = self.enforce_constraints(svg)
+                        if check_svg_valid(svg):
+                            choosen_svg = svg
+                            break
+                
+                assert choosen_svg is not None
+                return svg
+
+            except Exception as e:
+                logging.error('Exception during SVG generation: %s', e)
+                return self.default_svg
+        
+        return generate_svg()
+
+        # # Execute SVG generation in a new thread to enforce time constraints
+        # with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        #     future = executor.submit(generate_svg)
+        #     try:
+        #         return future.result(timeout=self.timeout_seconds)
+        #     except concurrent.futures.TimeoutError:
+        #         logging.warning("Prediction timed out after %s seconds.", self.timeout_seconds)
+        #         return self.default_svg
+        #     except Exception as e:
+        #         logging.error(f"An unexpected error occurred: {e}")
+        #         return self.default_svg
 
     def enforce_constraints(self, svg_string: str) -> str:
-        """Enforces constraints on SVG string"""
+        """Enforces constraints on an SVG string, removing disallowed elements
+        and attributes.
+
+        Parameters
+        ----------
+        svg_string : str
+            The SVG string to process.
+
+        Returns
+        -------
+        str
+            The processed SVG string, or the default SVG if constraints
+            cannot be satisfied.
+        """
+        logging.info('Sanitizing SVG...')
+
         try:
-            # Remove XML declarations and sanitize
-            svg_string = re.sub(r'<\?xml.*?\?>', '', svg_string, flags=re.DOTALL)
-            
-            parser = etree.XMLParser(
-                remove_blank_text=True,
-                remove_comments=True,
-                resolve_entities=False
-            )
+            parser = etree.XMLParser(remove_blank_text=True, remove_comments=True)
             root = etree.fromstring(svg_string, parser=parser)
         except etree.ParseError as e:
-            logger.error('SVG Parse Error: %s', e)
+            logging.error('SVG Parse Error: %s. Returning default SVG.', e)
             return self.default_svg
-
+    
         elements_to_remove = []
         for element in root.iter():
             tag_name = etree.QName(element.tag).localname
-
+    
             # Remove disallowed elements
             if tag_name not in self.constraints.allowed_elements:
                 elements_to_remove.append(element)
-                continue
-
+                continue  # Skip attribute checks for removed elements
+    
             # Remove disallowed attributes
-            allowed_attrs = (
-                self.constraints.allowed_elements.get(tag_name, []) +
-                self.constraints.allowed_elements['common']
-            )
-            
-            for attr in list(element.attrib.keys()):
+            attrs_to_remove = []
+            for attr in element.attrib:
                 attr_name = etree.QName(attr).localname
-                if attr_name not in allowed_attrs:
+                if (
+                    attr_name
+                    not in self.constraints.allowed_elements[tag_name]
+                    and attr_name
+                    not in self.constraints.allowed_elements['common']
+                ):
+                    attrs_to_remove.append(attr)
+    
+            for attr in attrs_to_remove:
+                logging.debug(
+                    'Attribute "%s" for element "%s" not allowed. Removing.',
+                    attr,
+                    tag_name,
+                )
+                del element.attrib[attr]
+    
+            # Check and remove invalid href attributes
+            for attr, value in element.attrib.items():
+                 if etree.QName(attr).localname == 'href' and not value.startswith('#'):
+                    logging.debug(
+                        'Removing invalid href attribute in element "%s".', tag_name
+                    )
                     del element.attrib[attr]
-                    logger.debug('Removed attribute: %s from %s', attr_name, tag_name)
 
-                # Validate href attributes
-                if attr_name == 'href' and (not element.attrib[attr].startswith('#') or len(element.attrib[attr]) > 100):
-                    del element.attrib[attr]
-                    logger.debug('Removed invalid href in %s', tag_name)
-
-            # Validate path elements
+            # Validate path elements to help ensure SVG conversion
             if tag_name == 'path':
-                d_attribute = element.get('d', '')
-                if not self.validate_path(d_attribute):
+                d_attribute = element.get('d')
+                if not d_attribute:
+                    logging.warning('Path element is missing "d" attribute. Removing path.')
                     elements_to_remove.append(element)
-                    logger.warning('Removed invalid path element')
-
-        # Remove disallowed elements
-        for element in elements_to_remove:
-            parent = element.getparent()
-            if parent is not None:
-                parent.remove(element)
-
-        try:
-            cleaned_svg = etree.tostring(root, encoding='unicode')
-            return self._sanitize_svg(cleaned_svg)
-        except Exception as e:
-            logger.error('SVG serialization failed: %s', e)
-            return self.default_svg
-
-    def validate_path(self, d_attribute: str) -> bool:
-        """Validate path 'd' attribute using regex with fallback"""
-        try:
-            # Strict validation
-            path_regex = re.compile(
-                r'^'
-                r'(?:'
-                    r'[MmZzLlHhVvCcSsQqTtAa]'  # Command
-                    r'\s*'  # Optional whitespace
-                    r'(?:'  # Parameters group
-                        r'-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?'  # Number with optional exponent
-                        r'(?:[\s,]+-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)*'  # Subsequent numbers
-                    r')?'  # Parameters are optional
+                    continue # Skip further checks for this removed element
+                # Use regex to validate 'd' attribute format
+                path_regex = re2.compile(
+                    r'^'  # Start of string
+                    r'(?:'  # Non-capturing group for each command + numbers block
+                    r'[MmZzLlHhVvCcSsQqTtAa]'  # Valid SVG path commands (adjusted to exclude extra letters)
+                    r'\s*'  # Optional whitespace after command
+                    r'(?:'  # Non-capturing group for optional numbers
+                    r'-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?'  # First number
+                    r'(?:[\s,]+-?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)*'  # Subsequent numbers with mandatory separator(s)
+                    r')?'  # Numbers are optional (e.g. for Z command)
+                    r'\s*'  # Optional whitespace after numbers/command block
+                    r')+'  # One or more command blocks
                     r'\s*'  # Optional trailing whitespace
-                r')+'  # One or more command sequences
-                r'$',
-                re.ASCII
+                    r'$'  # End of string
+                )
+                if not path_regex.match(d_attribute):
+                    logging.warning(
+                        'Path element has malformed "d" attribute format. Removing path.'
+                    )
+                    elements_to_remove.append(element)
+                    continue
+                logging.debug('Path element "d" attribute validated (regex check).')
+        
+        # Remove elements marked for removal
+        for element in elements_to_remove:
+            if element.getparent() is not None:
+                element.getparent().remove(element)
+                logging.debug('Removed element: %s', element.tag)
+
+        try:
+            cleaned_svg_string = etree.tostring(root, encoding='unicode')
+            return cleaned_svg_string
+        except ValueError as e:
+            logging.error(
+                'SVG could not be sanitized to meet constraints: %s', e
             )
-            return bool(path_regex.match(d_attribute))
-        except re.error:
-            # Fallback lenient check
-            return bool(re.match(r'^[MmZzLlHhVvCcSsQqTtAa].*', d_attribute))
-
-    def _sanitize_svg(self, svg_string: str) -> str:
-        """Additional security sanitization"""
-        # Remove risky elements/attributes
-        svg_string = re.sub(r'on\w+=".*?"', '', svg_string)
-        svg_string = re.sub(r'<script.*?</script>', '', svg_string, flags=re.DOTALL)
-        svg_string = re.sub(r'<!DOCTYPE.*?>', '', svg_string, flags=re.DOTALL)
-        return svg_string
-
-    def generate_valid_svg(self, description: str, model, attempt=1) -> str:
-        """Generate SVG with validation and retries"""
-        if attempt > self.max_retries:
-            logger.warning('Max retries reached for: %s', description)
             return self.default_svg
 
-        try:
-            response = model.generate_content(
-                self.prompt_template.format(description),
-                safety_settings={
-                    'HARM_CATEGORY_HATE_SPEECH': 'BLOCK_NONE',
-                    'HARM_CATEGORY_HARASSMENT': 'BLOCK_NONE',
-                    'HARM_CATEGORY_DANGEROUS_CONTENT': 'BLOCK_NONE'
-                }
-            )
-            
-            # Extract SVG code safely
-            raw_svg = response.text
-            svg_match = re.search(r'(<svg.*?</svg>)', raw_svg, re.DOTALL)
-            if not svg_match:
-                raise ValueError("No valid SVG code found in response")
-                
-            initial_svg = svg_match.group(1).strip()
-            sanitized_svg = self.enforce_constraints(initial_svg)
-            
-            # Final validation
-            if sanitized_svg == self.default_svg or not self.validate_compliance(sanitized_svg):
-                raise ValueError("SVG failed final compliance check")
-                
-            return sanitized_svg
-            
-        except Exception as e:
-            logger.warning('Attempt %d failed: %s', attempt, str(e))
-            time.sleep(self.retry_delay * attempt)
-            return self.generate_valid_svg(description, model, attempt+1)
-
-    def validate_compliance(self, svg: str) -> bool:
-        """Final XML validation"""
-        try:
-            etree.fromstring(svg)
-            return True
-        except Exception as e:
-            logger.error('Final validation failed: %s', e)
-            return False
-
-    def process_dataset(self, input_file: str, output_file: str):
-        """Process dataset with dynamic JSON writing"""
-        self.configure_api()
-        model = genai.GenerativeModel("gemini-2.5-pro-preview-05-06")
-
-        with open(input_file, 'r') as f:
-            dataset = json.load(f)
-
-        total = len(dataset['records'])
-        for idx, record in enumerate(dataset['records']):
-          record['id'] = idx+1
-        processed_count = 0
-
-        try:
-            with open(output_file, 'w') as f:
-                f.write('{\n  "records": [\n')
-                first_entry = True
-                
-                for i, record in enumerate(dataset['records']):
-                    try:
-                        logger.info('Processing %d/%d: %s', i+1, total, record['id'])
-                        sanitized_svg = self.generate_valid_svg(record['description'], model)
-                        
-                        # Create output record
-                        output_record = {
-                            **record,
-                            'svg': sanitized_svg
-                        }
-                        
-                        # Write to file immediately
-                        if not first_entry:
-                            f.write(',\n')
-                        else:
-                            first_entry = False
-                            
-                        json_str = json.dumps(
-                            output_record, 
-                            indent=4, 
-                            ensure_ascii=False
-                        )
-                        f.write(f'    {json_str}')
-                        f.flush()  # Force write to disk
-                        
-                        processed_count += 1
-                        time.sleep(self.api_delay)
-                        
-                    except Exception as e:
-                        logger.error('Failed to process record %s: %s', record['id'], str(e))
-                        continue
-
-        finally:
-            # Properly close the JSON array
-            with open(output_file, 'a') as f:
-                f.write('\n  ]\n}')
-
-        logger.info(f"Successfully processed {processed_count}/{total} records")
-
-if __name__ == "__main__":
-    generator = SVGGenerator()
-    generator.process_dataset("descriptions_dataset.json", "output_with_svgs.json")
+import kaggle_evaluation
+kaggle_evaluation.test(Model)
